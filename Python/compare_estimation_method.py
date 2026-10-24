@@ -1,15 +1,14 @@
 """
 Author      : Jie Li
-Date        : 2026-09-11 11:53:56
-Last Edited : 2026-09-11 11:58:38
+Date        : 2026-08-11 10:15:14
+Last Edited : 2026-10-08 21:53:41
 Last Author : Jie Li
-File Path   : /nonparametric_correlation_estimator_cubic/Python/compare_estimation_method.py
+File Path   : /nonparametric_correlation_estimator/Python/compare_estimation_method.py
 Description :
-
 Monte Carlo Comparison of Estimation Methods
 =============================================
 
-CLI tool for comparing 4 estimation methods (NW, LL, CE, CL) across
+CLI tool for comparing 4 estimation methods (NW, LL, CUBIC, CUBIC+LL) across
 different sample sizes using Monte Carlo simulations.
 
 Features:
@@ -19,13 +18,20 @@ Features:
     - Results saved in pickle format for downstream analysis
 
 Usage:
-    python compare_estimation_method.py --n_jobs 4 --n_repeats 200 --verbose 1
+    python compare_estimation_method.py --n_jobs 8 --n_repeats 500 --verbose 1
+
+
+
+
+
+
 
 Copyright (c) 2026, Jie Li, lijie_12@outlook.com
 All Rights Reserved.
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import pickle
@@ -122,6 +128,7 @@ def run_single_repetition(
     estimator_names,
     seed,
     verbose=0,
+    dist="gaussian",
 ):
     """
     Run a single Monte Carlo repetition for all 4 estimation methods.
@@ -129,6 +136,17 @@ def run_single_repetition(
     This function is designed to be called in parallel across repetitions.
     Within each repetition, grid_search and estimate_batch run sequentially
     (n_jobs=1) to avoid nested parallelization overhead.
+
+    Important implementation detail (process-safe factory):
+    -----------------------------------------------
+    Estimator instances are NOT created in the main process and then sent to
+    workers. Instead, this function accepts an `estimator_names` list and
+    constructs estimator instances locally inside the worker process/thread
+    using minimal parameters (currently only `kernel_name`). This lightweight
+    factory avoids pickling/ResourceTracker issues on macOS and makes the
+    `processes` backend safe on Linux provided that any native libraries
+    (OpenMP/MKL) are initialized inside the worker rather than at import-time
+    in the parent process.
 
     Parameters
     ----------
@@ -179,7 +197,7 @@ def run_single_repetition(
 
     # Generate data for this repetition
     U_train, X1_train, X2_train = rho_func.generate_data(
-        n=n_samples, random_state=rep_seed
+        n=n_samples, random_state=rep_seed, dist=dist
     )
 
     # True values at test points
@@ -190,6 +208,11 @@ def run_single_repetition(
         "rep_idx": rep_idx,
         "n": n_samples,
         "seed_used": rep_seed,
+        # Hash of the generated data, used to check that runs on different
+        # machines (e.g. LL on the server, other estimators locally) are paired.
+        "data_hash": hashlib.sha1(
+            np.ascontiguousarray([U_train, X1_train, X2_train]).tobytes()
+        ).hexdigest(),
         "estimators": {},
     }
 
@@ -232,6 +255,9 @@ def run_single_repetition(
             time_bandwidth = time.perf_counter() - t_bw_start
             h_opt = result_bw["optimal_h"]
 
+            # Count truncation fallbacks (CUBIC+LL) only for the final estimates
+            estimator.n_pinned = 0
+
             # Estimate at all test points with optimal bandwidth (sequential)
             t_est_start = time.perf_counter()
             rho_hat = estimator.estimate_batch(
@@ -257,6 +283,7 @@ def run_single_repetition(
                 "time_bandwidth": float(time_bandwidth),
                 "time_u_test": float(time_u_test),
                 "time_total": float(time_total),
+                "n_pinned": int(getattr(estimator, "n_pinned", 0)),
             }
 
             if verbose > 0:
@@ -302,6 +329,9 @@ def run_comparison(
     seed,
     verbose,
     logger,
+    rho_scale=1.0,
+    estimator_names=("NW", "LL", "CUBIC", "CUBIC+LL"),
+    dist="gaussian",
 ):
     """
     Run Monte Carlo comparison across all sample sizes.
@@ -415,7 +445,7 @@ def run_comparison(
 
     # Initialize correlation function and kernel
     try:
-        rho_func = get_correlation_function(correlation_function)
+        rho_func = get_correlation_function(correlation_function, scale=rho_scale)
         logger.info(f"✓ Correlation function loaded: {rho_func.name}")
         logger.info(f"  Formula: {rho_func.formula}")
     except Exception as e:
@@ -459,8 +489,8 @@ def run_comparison(
     logger.info("")
 
     # Estimator names - actual instances are created inside worker to avoid pickling
-    estimator_names = ["NW", "LL", "CUBIC", "CUBIC+LL"]
-    logger.info("✓ Prepared estimator names: NW, LL, CUBIC, CUBIC+LL")
+    estimator_names = list(estimator_names)
+    logger.info(f"✓ Prepared estimator names: {', '.join(estimator_names)}")
     logger.info("")
 
     # Storage for all results
@@ -469,6 +499,9 @@ def run_comparison(
             "n_list": n_list,
             "n_repeats": n_repeats,
             "correlation_function": correlation_function,
+            "rho_scale": rho_scale,
+            "dist": dist,
+            "estimators": estimator_names,
             "kernel_function": kernel_function,
             "sampling_strategy": sampling_strategy,
             "number_test": number_test,
@@ -518,6 +551,7 @@ def run_comparison(
                     h_grid=h_grid,
                     estimator_names=estimator_names,
                     seed=seed,
+                    dist=dist,
                     verbose=verbose,
                 )
                 rep_results_list.append(rep_result)
@@ -536,6 +570,7 @@ def run_comparison(
                         h_grid=h_grid,
                         estimator_names=estimator_names,
                         seed=seed,
+                        dist=dist,
                         verbose=verbose,
                     )
                     for rep_idx in (
@@ -560,6 +595,7 @@ def run_comparison(
                             h_grid=h_grid,
                             estimator_names=estimator_names,
                             seed=seed,
+                            dist=dist,
                             verbose=verbose,
                         )
                         for rep_idx in range(n_repeats)
@@ -574,7 +610,7 @@ def run_comparison(
 
         # Aggregate timing for each (sample size, estimator) combination
         timing_summary_n = {}
-        for est_name in ["NW", "LL", "CUBIC", "CUBIC+LL"]:
+        for est_name in estimator_names:
             bw_values = [
                 rep["estimators"][est_name]["time_bandwidth"]
                 for rep in rep_results_list
@@ -614,7 +650,7 @@ def run_comparison(
         )
         logger.info("  " + "-" * 60)
 
-        for est_name in ["NW", "LL", "CUBIC", "CUBIC+LL"]:
+        for est_name in estimator_names:
             mse_values = [
                 rep["estimators"][est_name]["mse"]
                 for rep in rep_results_list
@@ -638,7 +674,7 @@ def run_comparison(
         )
         logger.info("  " + "-" * 96)
 
-        for est_name in ["NW", "LL", "CUBIC", "CUBIC+LL"]:
+        for est_name in estimator_names:
             stats = timing_summary_n[est_name]
             if np.isnan(stats["sum_total"]):
                 logger.info(
@@ -798,6 +834,33 @@ def main():
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
 
+    # Rescaling of the true correlation function (Assumption (A3))
+    parser.add_argument(
+        "--rho_scale",
+        type=float,
+        default=0.999999,
+        help="Use rho_c(u) = rho_scale * rho(u), so that sup|rho_c| < 1 (A3)",
+    )
+
+    # Conditional distribution of (X1, X2) (non-Gaussian robustness, R3.4)
+    parser.add_argument(
+        "--dist",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "t5", "gamma2"],
+        help="Conditional distribution with unit variances and correlation rho(u)",
+    )
+
+    # Subset of estimators (e.g. run LL separately on another machine)
+    parser.add_argument(
+        "--estimators",
+        type=str,
+        nargs="+",
+        default=["NW", "LL", "CUBIC", "CUBIC+LL"],
+        choices=["NW", "LL", "CUBIC", "CUBIC+LL"],
+        help="Estimators to run",
+    )
+
     args = parser.parse_args()
 
     # Setup output directory and logger
@@ -823,6 +886,9 @@ def main():
             seed=args.seed,
             verbose=args.verbose,
             logger=logger,
+            rho_scale=args.rho_scale,
+            estimator_names=args.estimators,
+            dist=args.dist,
         )
 
         # Save results
